@@ -1,0 +1,191 @@
+name: دانلودر لینک مستقیم
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: "Direct File URL"
+        required: true
+        type: string
+
+      file_name:
+        description: "Custom file name (without extension)"
+        required: false
+        default: ""
+        type: string
+
+      file_extension:
+        description: "Custom file extension (mp4, zip, apk, ...)"
+        required: false
+        default: ""
+        type: string
+
+      zip_password:
+        description: "Archive password (optional)"
+        required: false
+        default: ""
+        type: string
+
+      max_part_mb:
+        description: "Maximum size per part (MB)"
+        required: false
+        default: "90"
+        type: string
+
+      upload_method:
+        description: "Upload Method"
+        required: true
+        default: repository
+        type: choice
+        options:
+          - repository
+          - release
+
+      release_tag:
+        description: "Release Tag"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  direct-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full curl
+
+      - name: Download File
+        id: download
+        shell: bash
+        run: |
+          mkdir -p temp_dl
+
+          FILE_URL="${{ github.event.inputs.file_url }}"
+          CUSTOM_NAME="${{ github.event.inputs.file_name }}"
+          CUSTOM_EXT="${{ github.event.inputs.file_extension }}"
+
+          ORIGINAL_NAME=$(basename "$FILE_URL" | cut -d'?' -f1)
+
+          if [ -n "$CUSTOM_NAME" ]; then
+            if [ -n "$CUSTOM_EXT" ]; then
+              FILENAME="${CUSTOM_NAME}.${CUSTOM_EXT}"
+            else
+              FILENAME="$CUSTOM_NAME"
+            fi
+          else
+            FILENAME="$ORIGINAL_NAME"
+          fi
+
+          FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._() -]/_/g')
+
+          [ -z "$FILENAME" ] && FILENAME="downloaded_file"
+
+          echo "Downloading as: $FILENAME"
+
+          curl -L --fail --retry 5 \
+            -o "temp_dl/$FILENAME" \
+            "$FILE_URL"
+
+          if [ ! -s "temp_dl/$FILENAME" ]; then
+            echo "Download failed"
+            exit 1
+          fi
+
+          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
+          echo "filepath=temp_dl/$FILENAME" >> "$GITHUB_OUTPUT"
+
+      - name: Create Split Archive
+        id: archive
+        shell: bash
+        run: |
+          FILEPATH="${{ steps.download.outputs.filepath }}"
+          PASS="${{ github.event.inputs.zip_password }}"
+          THRESH_MB="${{ github.event.inputs.max_part_mb }}"
+
+          if ! [[ "$THRESH_MB" =~ ^[0-9]+$ ]]; then
+            THRESH_MB=90
+          fi
+
+          if [ "$THRESH_MB" -lt 1 ]; then
+            THRESH_MB=90
+          fi
+
+          BASENAME=$(basename "$FILEPATH")
+
+          cd temp_dl
+
+          ARCHIVE_BASE="${BASENAME%.*}_$(date +%Y%m%d_%H%M%S)"
+
+          if [ -n "$PASS" ]; then
+            7z a \
+              -mx=3 \
+              -mhe=on \
+              -p"$PASS" \
+              -v${THRESH_MB}m \
+              "${ARCHIVE_BASE}.7z" \
+              "$BASENAME"
+          else
+            7z a \
+              -mx=3 \
+              -v${THRESH_MB}m \
+              "${ARCHIVE_BASE}.7z" \
+              "$BASENAME"
+          fi
+
+          if [ -f "${ARCHIVE_BASE}.7z.001" ] && [ ! -f "${ARCHIVE_BASE}.7z.002" ]; then
+            mv "${ARCHIVE_BASE}.7z.001" "${ARCHIVE_BASE}.7z"
+          fi
+
+          cd ..
+
+      - name: Push To Repository
+        if: github.event.inputs.upload_method == 'repository'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          mkdir -p downloads
+
+          mv temp_dl/* downloads/ 2>/dev/null || true
+
+          git add downloads/
+
+          git commit -m "Direct Download [skip ci]" || true
+
+          git push
+
+      - name: Generate Release Tag
+        if: github.event.inputs.upload_method == 'release'
+        id: tag
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.release_tag }}" ]; then
+            echo "tag=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=direct-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload Release
+        if: github.event.inputs.upload_method == 'release'
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.tag.outputs.tag }}
+          name: Direct Download Release
+          artifacts: "temp_dl/*"
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf temp_dl
